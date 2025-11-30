@@ -1,0 +1,117 @@
+name: "Notify Slack about workflow result"
+inputs:
+  results:
+    description: "Job Results"
+    required: true
+    type: string
+  token:
+    description: "Slack Bot Token"
+    type: string
+  runner-token:
+    description: "Runner Token"
+    type: string
+  channel:
+    description: "Slack Channel"
+    required: true
+    type: string
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout repo
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    - name: Set Token
+      uses: 2mc-org/env-handler-action@v1
+      with:
+        secrets: "{}"
+        script: |
+          if [ -n "${{ inputs.token }}" ]; then
+            set_env --name=SLACK_BOT_TOKEN --mask \
+              --value="${{ inputs.token }}"
+          else
+            set_env --name=SLACK_BOT_TOKEN --mask \
+              --value="$(get_runner_secret ${{ inputs.runner-token }})"
+          fi
+
+    - name: Determine Overall Status
+      shell: bash
+      run: |
+        statuses="${{ inputs.results }}"
+
+        if echo "$statuses" | grep -q "failure"; then
+            total_status="failure"
+            color="danger"
+        elif echo "$statuses" | grep -q "cancelled"; then
+            total_status="cancelled"
+            color="cancelled"
+        elif echo "$statuses" | grep -q "skipped"; then
+            total_status="skipped"
+            color="warning"
+        else
+            total_status="success"
+            color="good"
+        fi
+
+        echo "TOTAL_JOB_STATUS=${total_status^^}" >> $GITHUB_ENV
+        echo "TOTAL_JOB_STATUS_COLOR=$color" >> $GITHUB_ENV
+
+    - name: Get Commit List
+      id: commit_list
+      shell: bash
+      run: |
+        echo "Generating commit list with clickable SHA links for Slack..."
+
+        if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+        else
+            if git cat-file -e ${{ github.event.before }} 2>/dev/null; then
+                range="${{ github.event.before }}..${{ github.sha }}"
+            else
+                previous_commit=$(git rev-parse "${{ github.sha }}^")
+                range="$previous_commit..${{ github.sha }}"
+            fi
+        fi
+
+        commits=$(git log --pretty=format:"%h|%s|%an" $range)
+
+        linked_commits=""
+        count=0
+        while IFS="|" read -r sha msg author; do
+          if [ $count -ne 0 ]; then
+            linked_commits+="        "
+          fi
+
+          linked_commits+="<https://github.com/${GITHUB_REPOSITORY}/commit/${sha}|${sha}> — ${msg} (${author})"$'\n'
+          count=$((count + 1))
+        done <<< "$commits"
+
+        if [ -z "$linked_commits" ]; then
+          linked_commits="No commits detected (merge commit or empty diff)"
+        fi
+
+        {
+          echo "linked_commits<<EOF"
+          echo "$linked_commits"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Send Slack message
+      uses: slackapi/slack-github-action@v2.1.1
+      with:
+        method: chat.postMessage
+        token: ${{ env.SLACK_BOT_TOKEN }}
+        payload: |
+          channel: "#${{ inputs.channel }}"
+          attachments:
+            - color: ${{ env.TOTAL_JOB_STATUS_COLOR }}
+              fallback: "${{ env.TOTAL_JOB_STATUS }} ${{ github.repository }}"
+              text: |
+                *Status*: ${{ env.TOTAL_JOB_STATUS }}
+                *Workflow:* ${{ github.workflow }}
+                *Branch:* ${{ github.ref_name }}
+                *Run Details*: ${{ github.repository }} #${{ github.run_number }} (<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Open>)
+                *Commits included:*
+                  ${{ steps.commit_list.outputs.linked_commits }}
